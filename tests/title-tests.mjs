@@ -59,14 +59,25 @@ const entry = (role, content) => ({
 });
 
 check(
-  "branch: first user message wins",
-  "first prompt",
+  "branch: latest user message wins",
+  "newest prompt",
   fallbackTitleFromBranch([
     entry("system", "preamble"),
-    entry("user", "second prompt was asked later"),
-    entry("user", "first prompt"),
+    entry("user", "oldest prompt"),
     entry("assistant", [{ type: "text", text: "answer" }]),
-  ].map((e, i) => (i === 1 ? entry("user", "first prompt") : e)))
+    entry("user", "newest prompt"),
+    entry("assistant", [{ type: "text", text: "second answer" }]),
+  ])
+);
+check(
+  "branch: trailing non-user entries do not hide the latest prompt",
+  "newest prompt",
+  fallbackTitleFromBranch([
+    entry("user", "oldest prompt"),
+    entry("user", "newest prompt"),
+    { type: "message", message: { role: "toolResult", content: "out" } },
+    { type: "compaction", summary: "..." },
+  ])
 );
 check(
   "branch: array content flattened",
@@ -87,9 +98,22 @@ check(
   fallbackTitleFromBranch([entry("user", "  \n "), entry("user", "real one")])
 );
 check(
-  "branch: long first prompt capped at 60",
+  "branch: trailing whitespace-only message falls back to the one before",
+  "real one",
+  fallbackTitleFromBranch([entry("user", "real one"), entry("user", "  \n ")])
+);
+check(
+  "branch: trailing image-only message falls back to the one before",
+  "real one",
+  fallbackTitleFromBranch([
+    entry("user", "real one"),
+    entry("user", [{ type: "image", data: "..." }]),
+  ])
+);
+check(
+  "branch: long latest prompt capped at 60",
   "a".repeat(60),
-  fallbackTitleFromBranch([entry("user", "a".repeat(200))])
+  fallbackTitleFromBranch([entry("user", "short"), entry("user", "a".repeat(200))])
 );
 check("branch: no user message", undefined, fallbackTitleFromBranch([entry("system", "x")]));
 check("branch: empty branch", undefined, fallbackTitleFromBranch([]));

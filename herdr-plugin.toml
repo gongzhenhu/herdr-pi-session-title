@@ -1,8 +1,8 @@
 id = "gongzhenhu.herdr-pi-session-title"
 name = "Pi Session Title"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.7.0"
-description = "Reports the pi coding agent session title (/name or first prompt) as the herdr pane metadata title"
+description = "Reports the pi coding agent session title (/name or latest prompt) as the herdr pane metadata title"
 platforms = ["linux", "macos"]
 
 [[actions]]

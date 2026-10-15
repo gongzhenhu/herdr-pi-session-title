@@ -6,8 +6,9 @@
 //
 // Title sources, in priority order:
 //   1. the session display name (set with /name or --name; session_info entry)
-//   2. the first user message on the active branch, capped at 60 characters —
-//      the same fallback pi's own session selector shows for unnamed sessions
+//   2. the latest user message on the active branch, capped at 60 characters —
+//      the pane title tracks what you are asking about right now, so it moves
+//      forward with every prompt you send
 //
 // Reported on the herdr socket as pane.report_metadata with the source token
 // `agent:title`, exactly like the Claude Code and Codex sibling plugins. The
@@ -116,14 +117,17 @@ export function messageText(content) {
   return undefined;
 }
 
-// Fallback title: the first user message on the active branch, mirroring what
-// pi's session selector shows for unnamed sessions. Re-derived from the branch
-// on every event, so it stays stable across turns and survives reloads.
+// Fallback title: the latest user message on the active branch. Scanned
+// backwards so the newest prompt with usable text wins and whitespace-only or
+// image-only messages fall through to the one before them. Re-derived from the
+// branch on every event, so it survives reloads and in-process session
+// switches without any cached state.
 export function fallbackTitleFromBranch(entries) {
   if (!Array.isArray(entries)) {
     return undefined;
   }
-  for (const entry of entries) {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
     if (!entry || entry.type !== "message") {
       continue;
     }
@@ -179,7 +183,7 @@ export default function (pi) {
       return;
     }
     // /name set or cleared: the name wins while set; when cleared, fall back
-    // to the first user message again (or nothing on a fresh session).
+    // to the latest user message again (or nothing on a fresh session).
     void reportTitle(currentTitle(ctx) ?? null);
   });
 
@@ -195,10 +199,14 @@ export default function (pi) {
     if (pi.getSessionName?.()) {
       return;
     }
-    // First prompt of an unnamed session serves as the fallback title. The
-    // branch may already contain it; either way the first user message wins.
+    // The prompt being submitted right now is the title, so the pane tracks
+    // the conversation instead of staying pinned to its opening message.
+    // event.prompt is exact; the branch is only a safety net for a prompt with
+    // no usable text, and cannot be preferred here because pi may not have
+    // appended this prompt yet — a backwards scan would then return the
+    // previous turn's prompt and leave the title one turn stale.
     const title =
-      fallbackTitle(ctx) ?? truncateTitle(event.prompt, MAX_PROMPT_CHARS);
+      truncateTitle(event.prompt, MAX_PROMPT_CHARS) ?? fallbackTitle(ctx);
     if (title) {
       void reportTitle(title);
     }
