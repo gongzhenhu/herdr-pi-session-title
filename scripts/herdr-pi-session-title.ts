@@ -6,7 +6,10 @@
 //
 // Title sources, in priority order:
 //   1. the session display name (set with /name or --name; session_info entry)
-//   2. the latest user message on the active branch, capped at 60 characters —
+//   2. a pinned title (title-pin token, set by the pane-titles skill after it
+//      read the whole conversation) — it suppresses source 3 until /name or
+//      a brand-new session in this pane clears the pin
+//   3. the latest user message on the active branch, capped at 60 characters —
 //      the pane title tracks what you are asking about right now, so it moves
 //      forward with every prompt you send
 //
@@ -34,25 +37,39 @@ function enabled() {
 }
 
 function sendRequest(request, timeoutMs) {
+  // Resolves with the first parsed response frame, or null on any failure
+  // (timeout, connection error, malformed frame). Fail-open by design.
   return new Promise((resolve) => {
     let done = false;
     let timeout;
-    const finish = (delivered) => {
+    let buffer = "";
+    const finish = (value) => {
       if (done) return;
       done = true;
       if (timeout) {
         clearTimeout(timeout);
       }
       socket.destroy();
-      resolve(delivered);
+      resolve(value);
     };
 
     const socket = net.createConnection(socketPath);
-    socket.on("error", () => finish(false));
+    socket.on("error", () => finish(null));
     socket.on("connect", () => socket.write(`${JSON.stringify(request)}\n`));
-    socket.on("data", () => finish(true));
-    socket.on("end", () => finish(false));
-    timeout = setTimeout(() => finish(false), timeoutMs);
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      const newline = buffer.indexOf("\n");
+      if (newline === -1) {
+        return; // frame not complete yet
+      }
+      try {
+        finish(JSON.parse(buffer.slice(0, newline)));
+      } catch {
+        finish(null);
+      }
+    });
+    socket.on("end", () => finish(null));
+    timeout = setTimeout(() => finish(null), timeoutMs);
     timeout.unref?.();
   });
 }
@@ -64,8 +81,14 @@ function nextReportSeq() {
   return reportSeq;
 }
 
-function reportTitle(title) {
-  // title: string to set, null to clear
+function reportTitle(title, opts) {
+  // title: string to set, null to clear. opts.clearPin also drops title-pin
+  // (a /name outranks a pinned skill title and consumes the pin). A null
+  // token value is the wire syntax for clearing that token.
+  const tokens = { title: title ?? null };
+  if (opts?.clearPin) {
+    tokens["title-pin"] = null;
+  }
   return sendRequest(
     {
       id: `${source}:${Date.now()}:${Math.random().toString(36).slice(2)}`,
@@ -75,11 +98,32 @@ function reportTitle(title) {
         source,
         agent,
         seq: nextReportSeq(),
-        tokens: { title: title ?? null },
+        tokens,
       },
     },
     500
   );
+}
+
+async function titlePinned() {
+  // True when the pane title was pinned by the pane-titles skill: the pin
+  // suppresses auto-derived titles (prompt truncation) until the user names
+  // the session (/name) or a brand-new session starts in this pane.
+  // Fail-open: unqueryable herdr reads as unpinned.
+  try {
+    const response = await sendRequest(
+      {
+        id: `${source}:get:${Date.now()}:${Math.random().toString(36).slice(2)}`,
+        method: "pane.get",
+        params: { pane_id: paneId },
+      },
+      500
+    );
+    const tokens = response?.result?.pane?.tokens;
+    return !!tokens && "title-pin" in tokens;
+  } catch {
+    return false;
+  }
 }
 
 export function sanitizeTitle(text) {
@@ -166,28 +210,51 @@ export default function (pi) {
     return fallbackTitle(ctx);
   }
 
-  pi.on("session_start", (event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
     // TUI only: RPC/JSON/print modes are headless (no PTY herdr can display).
     if (ctx?.mode !== "tui") {
       return;
     }
     attached = true;
-    const title = currentTitle(ctx);
-    // Report the resumed/named session's title, or clear a stale one left by a
+    const named = truncateTitle(pi.getSessionName?.(), MAX_TITLE_CHARS);
+    if (named) {
+      // /name outranks a pinned skill title and consumes the pin.
+      await reportTitle(named, { clearPin: true });
+      return;
+    }
+    const fallback = fallbackTitle(ctx);
+    if (await titlePinned()) {
+      if (fallback) {
+        // Resuming a session with history: the pinned title still names it.
+        return;
+      }
+      // Brand-new session in this pane: the pin belonged to the old one.
+      await reportTitle(null, { clearPin: true });
+      return;
+    }
+    // Report the resumed session's title, or clear a stale one left by a
     // previous session in this pane that died without firing session_shutdown.
-    void reportTitle(title ?? null);
+    await reportTitle(fallback ?? null);
   });
 
-  pi.on("session_info_changed", (event, ctx) => {
+  pi.on("session_info_changed", async (event, ctx) => {
     if (!attached) {
       return;
     }
     // /name set or cleared: the name wins while set; when cleared, fall back
     // to the latest user message again (or nothing on a fresh session).
-    void reportTitle(currentTitle(ctx) ?? null);
+    const named = truncateTitle(pi.getSessionName?.(), MAX_TITLE_CHARS);
+    if (named) {
+      await reportTitle(named, { clearPin: true });
+      return;
+    }
+    if (await titlePinned()) {
+      return;
+    }
+    await reportTitle(fallbackTitle(ctx) ?? null);
   });
 
-  pi.on("before_agent_start", (event, ctx) => {
+  pi.on("before_agent_start", async (event, ctx) => {
     if (!attached) {
       return;
     }
@@ -199,6 +266,11 @@ export default function (pi) {
     if (pi.getSessionName?.()) {
       return;
     }
+    if (await titlePinned()) {
+      // The skill's title survives new prompts: it was derived from the
+      // whole conversation, not from the latest message.
+      return;
+    }
     // The prompt being submitted right now is the title, so the pane tracks
     // the conversation instead of staying pinned to its opening message.
     // event.prompt is exact; the branch is only a safety net for a prompt with
@@ -208,7 +280,7 @@ export default function (pi) {
     const title =
       truncateTitle(event.prompt, MAX_PROMPT_CHARS) ?? fallbackTitle(ctx);
     if (title) {
-      void reportTitle(title);
+      await reportTitle(title);
     }
   });
 
@@ -218,8 +290,13 @@ export default function (pi) {
     }
     // Covers quit AND in-process switches (/new, /resume, /fork, reload):
     // every one of those is followed by a session_start that re-reports.
-    // Awaited so pi stays alive until the clear reaches the herdr socket —
+    // A pinned title stays put here: session_start decides whether the next
+    // session may keep it (resumed) or clears it (brand-new).
+    // Awaited so pi stays alive until the write reaches the herdr socket —
     // a fire-and-forget send can lose the race against process exit.
+    if (await titlePinned()) {
+      return;
+    }
     await reportTitle(null);
   });
 }
